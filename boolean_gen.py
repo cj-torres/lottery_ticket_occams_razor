@@ -56,7 +56,15 @@ def boolean_to_key(vector):
 class SimpleNumpyDNN:
     def __init__(self, architecture):
         # Initialize weights for each layer based on the architecture
-        self.weights = [np.random.randn(y, x) for x, y in zip(architecture[:-1], architecture[1:])]
+        self.weights = []
+        self.biases = []
+        for x, y in zip(architecture[:-1], architecture[1:]):
+            # Xavier uniform initialization for weights
+            limit = np.sqrt(6 / (x + y))
+            self.weights.append(np.random.uniform(-limit, limit, (y, x)))
+
+            # Bias initialization (zeros or small random values)
+            self.biases.append(np.zeros(y))
 
     def forward(self, inputs):
         # Check if inputs have the right size
@@ -65,13 +73,18 @@ class SimpleNumpyDNN:
 
         # Perform a forward pass
         activations = inputs
-        for w in self.weights:
-            activations = self.heaviside(np.dot(activations, w.T)) # Transpose weights to align for matrix multiplication
+        for w, b in zip(self.weights, self.biases):
+            activations = np.dot(activations, w.T) + b  # Adding bias
+            activations = self.heaviside(activations)  # Applying Heaviside activation function
         return activations
 
-    def sample(self, mu, sigma):
+    def sample(self):
         # Sample new parameters for the network
-        self.weights = [mu + sigma * np.random.randn(*w.shape) for w in self.weights]
+        new_weights = []
+        for weight in self.weights:
+            limit = np.sqrt(6 / sum(tuple(weight.shape)))
+            new_weights.append(np.random.uniform(-limit, limit, tuple(weight.shape)))
+        self.weights = new_weights
 
     def mask(self, masks):
         # Apply a boolean mask to the parameters of the network
@@ -140,7 +153,27 @@ class MDLDNN(torch.nn.Module):
         return sum([w.count_l2() for w in self.weights])
 
 
-def train_model(data_tuple, num_epochs, lam, *args):
+class DNN(torch.nn.Module):
+    def __init__(self, architecture, activation):
+        # Initialize weights for each layer based on the architecture
+        super(DNN, self).__init__()
+        layers = []
+        for x, y in zip(architecture[:-1], architecture[1:]):
+            # Create a linear layer with Xavier initialization for weights
+            layer = torch.nn.Linear(x, y)
+            torch.nn.init.xavier_uniform_(layer.weight)
+            torch.nn.init.zeros_(layer.bias)
+            layers.append(layer)
+            layers.append(activation)
+
+        # Assigning the sequential container to self.layers
+        self.layers = torch.nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+def train_model_mdl(data_tuple, num_epochs, lam, *args):
     # Unpack the data tuple
     x, y = data_tuple
     SAMPLES_PER_STEP = 4
@@ -174,14 +207,42 @@ def train_model(data_tuple, num_epochs, lam, *args):
     return criterion(model(x).squeeze(), y).item(), model.count_l0().item()
 
 
+def train_model(data_tuple, num_epochs, *args):
+    # Unpack the data tuple
+    x, y = data_tuple
+    SAMPLES_PER_STEP = 4
+
+    # Convert boolean tensors to long type if necessary
+    x = torch.tensor(x).float()
+    y = torch.tensor(y).float()
+
+    # Initialize the model with the provided arguments
+    model = DNN(*args)
+
+    # Define the loss function and optimizer
+    criterion = torch.nn.BCELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=.01)
+
+    #breakpoint()
+    # Training loop
+    for epoch in range(num_epochs):
+        optimizer.zero_grad()
+        outputs = model(x)
+        criterion(outputs.squeeze(), y).backward()
+
+        optimizer.step()
+
+        #print(f'Epoch [{epoch + 1}/{num_epochs}], Loss: {ce_loss.item():.4f}, L0: {l0.item():.4f}')
+
+    return criterion(model(x).squeeze(), y).item(), model.count_l0().item()
 
 
-def find_lambda(boolean_function, num_epochs, num_tests, stop_accuracy, epsilon, model_args):
+def find_lambda(boolean_function, num_epochs, num_tests, stop_magnitude, epsilon, model_args):
     '''
     :param boolean_function: boolean function to test
     :param num_epochs: number of epochs to train the function on
     :param num_tests: how many trials to perform for each lambda
-    :param stop_accuracy: how close
+    :param stop_magnitude: how close
     :param epsilon: allowable deviation from loss
     :param model_args: args to parameterize MDLDNN model
     :return:
@@ -190,7 +251,7 @@ def find_lambda(boolean_function, num_epochs, num_tests, stop_accuracy, epsilon,
     def lambda_test(num_tests, epsilon, boolean_function, num_epochs, lam, *args):
         l0_results = []
         for i in range(num_tests):
-            loss, l0 = train_model(boolean_function, num_epochs, lam, *args)
+            loss, l0 = train_model_mdl(boolean_function, num_epochs, lam, *args)
             if loss < epsilon:
                 l0_results.append(l0)
 
@@ -201,12 +262,12 @@ def find_lambda(boolean_function, num_epochs, num_tests, stop_accuracy, epsilon,
 
         return best_l0
 
-    lower_bound = 0
+    lower_bound = 1e-8
     upper_bound = 1
     best_l0_overall = float('inf')
 
-    while upper_bound - lower_bound > stop_accuracy:
-        lam = (upper_bound + lower_bound) / 2
+    while math.log(upper_bound) - math.log(lower_bound) > stop_magnitude:
+        lam = math.exp(math.log(upper_bound) - (math.log(upper_bound) - math.log(lower_bound))/2)
 
         best_l0_from_test = lambda_test(num_tests, epsilon, boolean_function, num_epochs, lam, *model_args)
 
@@ -218,19 +279,19 @@ def find_lambda(boolean_function, num_epochs, num_tests, stop_accuracy, epsilon,
         else:
             upper_bound = lam
 
-        print(f'Target lambda between {lower_bound:.5f} and {upper_bound:.5f}, best solution contains {best_l0_overall:.4f} parameters.')
+        print(f'Target lambda between {lower_bound} and {upper_bound}, best solution contains {best_l0_overall:.2f} parameters.')
 
     return best_l0_overall
 
 
-def get_init_dist(n):
+def get_init_dist(n, hidden_layers, samples):
     function_counter = Counter()
     function_complexity = {}
     inputs = np.array([np.array([bool(int(j)) for j in format(i, f'0{n}b')]) for i in range(2**n)])
 
-    net = SimpleNumpyDNN([n, n, n, 1])
-    for i in range(1000000):
-        net.sample(0,1)
+    net = SimpleNumpyDNN([n, *hidden_layers, 1])
+    for i in range(samples):
+        net.sample()
         out = net.forward(inputs)
         function_counter.update([tuple(out.squeeze())])
         as_str = ''.join([str(b) for b in out.squeeze()])
@@ -239,6 +300,41 @@ def get_init_dist(n):
             function_complexity[tuple(out.squeeze())] = lempel_ziv(as_str)
 
     return function_counter, function_complexity
+
+
+def get_convergence_time(boolean_function, model_args, samples, epsilon):
+    def get_conv(data_tuple, epsilon, *args):
+        # Unpack the data tuple
+        x, y = data_tuple
+
+        # Convert boolean tensors to long type if necessary
+        x = torch.tensor(x).float()
+        y = torch.tensor(y).float()
+
+        # Initialize the model with the provided arguments
+        model = DNN(*args)
+
+        # Define the loss function and optimizer
+        criterion = torch.nn.BCELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=.01)
+
+        # breakpoint()
+        # Training loop
+        epoch = 0
+        while True:
+            optimizer.zero_grad()
+            outputs = model(x)
+            loss = criterion(outputs.squeeze(), y).backward()
+            if loss < epsilon:
+                return epoch
+            optimizer.step()
+            epoch += 1
+
+    run_epochs = []
+    for i in range(samples):
+        run_epochs.append(get_conv(boolean_function, epsilon, *model_args))
+
+    return sum(run_epochs)/samples
 
 
 # def parallel_train(n):
